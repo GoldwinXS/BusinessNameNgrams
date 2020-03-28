@@ -1,8 +1,11 @@
-import requests, bs4
-import numpy as np
+import requests
+import bs4
+import pickle
+import os
 from time import sleep
 from tqdm import tqdm
-import pickle, os, statistics
+from nltk.corpus import stopwords
+from nltk import word_tokenize
 
 
 def save_pickle(obj, filename):
@@ -42,31 +45,27 @@ def get_docs(url):
     # parse data
     soup = bs4.BeautifulSoup(req.text, 'html.parser')
 
-    # find all tags
-    tags = soup.find_all('a')
+    # find all tags inside of the body
+    body = soup.find_all('div', attrs={'class': 'mw-body-content'})
 
-    # filter tags to the ones that have a "title" attribute. Remove extraneous strings...
-    clean = lambda x: x.replace('(page does not exist)', '').replace('(website)', '').replace('(company)',
-                                                                                              '').lower() if not x.lower().__contains__(
-        'wiki') else None
+    # get text from inside of the body. Set to last entry as that seems to be the one with the content
+    tags = bs4.BeautifulSoup(body[-1].text, 'html.parser')
 
-    # extract text and clean
-    tags = [clean(t['title']) for t in tags if t.has_attr('title')]
+    # tokenize words and remove non-alphanumeric elements
+    words = list(set([word for word in word_tokenize(tags.text) if word.isalpha()]))
 
-    # remove any None values
-    tags = [t for t in tags if not isinstance(t, type(None))]
-
-    # get out all of the text. Converted to a set to mitigate the affect of extraneous data
-    return list(set(tags))
+    # remove stopwords
+    return [word for word in words if word not in stopwords.words()]
 
 
-def wiki_crawler(url, save_freq=10, max_val=100, courtesy_sleep=1):
+def wiki_crawler(url, save_freq=10, max_requests=100, courtesy_sleep=1):
     """
+    This crawler is meant to grab company names from wikipedia. It only goes one level deep for now.
 
     Args:
         courtesy_sleep: (float): how long to wait between requests
-        max_val: (int): max number of requests
-        save_freq: (int): how often to save
+        max_val (int): max number of requests
+        save_freq (int): how often to save
         url (str): where to look first
     """
     base_wiki_url = 'https://en.wikipedia.org/'
@@ -80,9 +79,16 @@ def wiki_crawler(url, save_freq=10, max_val=100, courtesy_sleep=1):
     # parse data
     soup = bs4.BeautifulSoup(req.text, 'html.parser')
 
-    # find all tags
-    tags = soup.find_all('a', href=True)
+    # get body of the text
+    body = soup.find_all('div', attrs={'class': 'mw-body-content'})[-1]
 
+    # find all tags
+    tags = body.find_all('a', href=True)
+
+    # get the tags with a title
+    tags = [tag for tag in tags if tag.has_attr('title')]
+
+    print(f'Crawling from {base_wiki_url + url}...')
     for i, tag in tqdm(enumerate(tags)):
         # get docs from site
         docs += get_docs(base_wiki_url + tag['href'])
@@ -94,24 +100,23 @@ def wiki_crawler(url, save_freq=10, max_val=100, courtesy_sleep=1):
         if i % save_freq == 0 and len(docs) > 0:
             save_pickle(docs, 'data.pickle')
 
-        if i + 1 % max_val == 0:
+        if (i + 1) % max_requests == 0:
             break
 
-    docs = list(set(docs))
-    docs = [d for d in docs if not d.__contains__('list')]
+    docs = [d for d in list(set(docs)) if not d.__contains__('list')]
 
     save_pickle(docs, 'data.pickle')
 
     return docs
 
 
-def make_polygram_dict(docs, bigram_length=2, allow_variable_size=True):
+def ngram_dict(docs, bigram_length=2, allow_variable_size=True):
     """
-    construct polygrams (bigrams of varying size) and put them into a dictionary. Normalize values.
+    construct ngrams (bigrams of varying size) and put them into a dictionary. Normalize values.
 
     Args:
-        allow_variable_size: (bool): can the bigrams be a variable size?
-        bigram_length: (int): how long should the polygram be
+        allow_variable_size (bool): can the bigrams be a variable size?
+        bigram_length (int): how long should the ngram be
         docs (object): a list of strings
     """
     # start a dict to keep track of bigrams
@@ -120,18 +125,12 @@ def make_polygram_dict(docs, bigram_length=2, allow_variable_size=True):
     # iterate over each doc
     for doc in docs:
         # iterate over the characters in that doc
-        for i in range(len(doc)):
+        for i in range(len(doc) - bigram_length):
 
-            # handle the edge cases
-            if i == 0:
-                bigram = ('START',) + tuple(doc[i:i + bigram_length - 1])
-            elif i == len(doc) - bigram_length:
-                bigram = tuple(doc[i:i + bigram_length - 1]) + ('STOP',)
-            else:
-                bigram = tuple(doc[i:i + bigram_length])
+            bigram = tuple(doc[i:i + bigram_length])
 
             if allow_variable_size:
-                # if we've seen this bigram before, then add 1 to the count. Otherwise, add
+                # if we've seen this bigram before, then add 1 to the count. Otherwise, add it
                 if bigram in bigram_dict:
                     bigram_dict[bigram] += 1
                 else:
@@ -144,69 +143,67 @@ def make_polygram_dict(docs, bigram_length=2, allow_variable_size=True):
                 else:
                     bigram_dict[bigram] = 1
 
-    std = statistics.stdev([x for x in bigram_dict.values()])
-    mean = statistics.mean([x for x in bigram_dict.values()])
-    normed_bigrams = {k: (v - mean) / std for k, v in bigram_dict.items()}
+    uniques = len(bigram_dict)
+    bigrams = {k: v / uniques for k, v in bigram_dict.items()}
 
-    return normed_bigrams
+    return bigrams
 
 
-def get_next_bigram(bigram, randomness=0.001):
-    """ function to return the next bigram """
-    len_bigram = len(bigram)
+def get_highest_val_ngram(dictionary):
+    """
+    simply returns the ngram with the highest value
 
-    # find all of the bigrams that start the way our bigram ends, below the randomness threshold
-    random_val = np.random.uniform(0, randomness)
-    print(bigram[1])
-    next_options = {k: v for k, v in normed_bigrams.items() if bigram[1] == k[0]}
-    print(next_options)
+    Args:
+        dictionary (dict): a dictionary of ngrams
+    """
     max_num = 0
     next_gram = None
-    for k, v in next_options.items():
+    for k, v in dictionary.items():
         if v > max_num:
             max_num = v
             next_gram = k
 
     return next_gram
 
-    #         # pick one out at random and return that. Else return None.
-    # if len(next_options) > 0:
-    #     random_index = np.random.randint(len(next_options))
-    #     return next_options[0]
-    # else:
-    #     return None
+
+def get_next_ngram(bigram):
+    """ function to return the next bigram """
+
+    ngram_len = len(bigram)
+
+    # find all of the bigrams that start the way our bigram ends, below the randomness threshold
+    next_options = {k: v for k, v in ngrams.items() if bigram[1:] == k[:-1]}
+
+    return get_highest_val_ngram(next_options)
 
 
-def query_dict(max_length=10, randomness=0.0001):
+def query_dict(max_length=10, start_char='a'):
     """ simple function to generate new texts from a bigram dict
 
     Args:
-        randomness (float): how random the results are. The higher, the more certainty.
+        start_char (str): first character to begin with
         max_length (int): how many characters to generate
     """
 
     # setup text var
-    text = ''
+    text = start_char
 
     # get the start bigrams
-    start_bigrams = {k: i for k, i in normed_bigrams.items() if k[0] == 'START'}
-
-    # generate a random value
-    rand_val = np.random.uniform(0, randomness)
+    start_bigrams = {k: i for k, i in ngrams.items()}
 
     # get the bigrams that are higher than the random value
-    start_bigram = list({k: v for k, v in start_bigrams.items() if v > rand_val})
-    current_bigram = start_bigram[np.random.randint(len(start_bigram))]
+    start_ngram = list({k: v for k, v in start_bigrams.items()})
+    current_ngram = start_ngram[0]
 
     # get the first letter
-    text += current_bigram[1]
+    text += current_ngram[1]
 
     while len(text) < max_length:
-        current_bigram = get_next_bigram(current_bigram, randomness=randomness)
+        current_ngram = get_next_ngram(current_ngram)
 
         # if we find a bigram, then add the value of the next bigram to that
-        if current_bigram:
-            text += current_bigram[0]
+        if current_ngram:
+            text += current_ngram[0]
         else:
             break
 
@@ -220,6 +217,6 @@ else:
     print('Crawling...')
     docs = wiki_crawler('wiki/Lists_of_companies', save_freq=1)
 
-normed_bigrams = make_polygram_dict(docs, 2, allow_variable_size=False)
-test = query_dict(max_length=15,randomness=0.1)
+ngrams = ngram_dict(docs, 2, allow_variable_size=False)
+test = query_dict(max_length=15)
 print(test)
